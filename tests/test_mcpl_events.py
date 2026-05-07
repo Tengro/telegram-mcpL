@@ -168,7 +168,10 @@ async def test_dm_text_message_basic_metadata():
     assert out["channelId"] == "telegram:default:dm:42"
     assert out["messageId"] == "100"
     assert out["author"] == {"id": "42", "name": "Alice"}
-    assert out["content"] == [{"type": "text", "text": "hi there"}]
+    # Speaker header is prepended so the LLM knows who's writing.
+    assert out["content"] == [
+        {"type": "text", "text": "Alice (@alice): hi there"}
+    ]
     assert out["timestamp"].endswith("+00:00")
     md = out["metadata"]
     assert md["account"] == "default"
@@ -223,10 +226,12 @@ async def test_explicit_mention_name_marks_isMention_with_id_in_list():
 
 @pytest.mark.asyncio
 async def test_reply_metadata_includes_snippet_and_author():
-    chat = make_user(42, first="Alice")
+    chat = make_user(42, first="Alice", username="alice")
     sender = chat
+    replied_sender = make_user(99, first="Bot", username="thebot")
     replied = FakeMessage(id=50, text="original message text")
     replied.sender_id = 99  # we are the original author
+    replied.sender = replied_sender  # Telethon-cached User entity
     msg = FakeMessage(
         id=100,
         text="thanks",
@@ -247,6 +252,89 @@ async def test_reply_metadata_includes_snippet_and_author():
     assert md["replyToContent"] == "original message text"
     assert md["replyToAuthorId"] == "99"
     assert md["isReplyToBot"] is True
+    # Replied-to author name must be resolved so the agent knows whom it's
+    # responding to (not just an opaque user id).
+    assert md["replyToAuthorName"] == "Bot"
+    assert md["replyToAuthorUsername"] == "thebot"
+    # Speaker header should also include the reply context line.
+    assert out["content"][0]["type"] == "text"
+    text = out["content"][0]["text"]
+    assert "↳ in reply to Bot" in text
+    assert '"original message text"' in text
+    assert "Alice (@alice): " in text
+    assert text.endswith("thanks")
+
+
+@pytest.mark.asyncio
+async def test_reply_without_resolved_sender_falls_back_gracefully():
+    """If the replied message's sender entity isn't cached, we still emit
+    replyToAuthorId + replyToContent — just no name."""
+    chat = make_user(42, first="Alice", username="alice")
+    sender = chat
+    replied = FakeMessage(id=50, text="earlier")
+    replied.sender_id = 7
+    # No replied.sender set — entity not cached
+    msg = FakeMessage(
+        id=100,
+        text="ok",
+        is_reply=True,
+        reply_to=SimpleNamespace(reply_to_msg_id=50, forum_topic=False),
+        replied=replied,
+    )
+    event = FakeEvent(msg, chat, sender)
+
+    out = await build_incoming_message(
+        event, account_label="default", self_id=99, self_username=None
+    )
+
+    assert out is not None
+    md = out["metadata"]
+    assert md["isReply"] is True
+    assert md["replyToAuthorId"] == "7"
+    assert md["replyToContent"] == "earlier"
+    assert "replyToAuthorName" not in md
+    # Header still has the reply context (anonymous form), just not the name
+    text = out["content"][0]["text"]
+    assert '↳ in reply to: "earlier"' in text
+
+
+@pytest.mark.asyncio
+async def test_speaker_header_with_no_username():
+    chat = make_user(42, first="Alice")  # no username
+    sender = chat
+    msg = FakeMessage(id=100, text="hi")
+    event = FakeEvent(msg, chat, sender)
+
+    out = await build_incoming_message(
+        event, account_label="default", self_id=99, self_username=None
+    )
+
+    assert out is not None
+    assert out["content"] == [{"type": "text", "text": "Alice: hi"}]
+
+
+@pytest.mark.asyncio
+async def test_speaker_header_with_media_only():
+    """Photo with no text — the placeholder block gets the speaker header."""
+    chat = make_user(42, first="Alice", username="alice")
+    sender = chat
+
+    class _MMP:
+        pass
+    _MMP.__name__ = "MessageMediaPhoto"
+    msg = FakeMessage(id=100, text="", media=_MMP())
+    event = FakeEvent(msg, chat, sender)
+
+    out = await build_incoming_message(
+        event, account_label="default", self_id=99, self_username=None
+    )
+
+    assert out is not None
+    text_blocks = [b for b in out["content"] if b.get("type") == "text"]
+    # The first text block was the [photo] placeholder; header should be
+    # prepended to it.
+    assert any("Alice (@alice):" in b.get("text", "") for b in text_blocks)
+    assert any("[photo]" in b.get("text", "") for b in text_blocks)
 
 
 class FakeChatActionEvent:

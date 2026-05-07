@@ -67,24 +67,82 @@ def _peer_kind(chat: Any) -> str | None:
     return None
 
 
+def _resolve_name(entity: Any) -> str:
+    """Best-effort human-readable name for a User/Chat/Channel entity.
+
+    Order: title (groups/channels) → first+last → @username → id.
+    Falls back to "Unknown" if `entity` is None.
+    """
+    if entity is None:
+        return "Unknown"
+    title = getattr(entity, "title", None)
+    if title:
+        return str(title)
+    first = getattr(entity, "first_name", None) or ""
+    last = getattr(entity, "last_name", None) or ""
+    full = f"{first} {last}".strip()
+    if full:
+        return full
+    username = getattr(entity, "username", None)
+    if username:
+        return f"@{username}"
+    return f"id:{getattr(entity, 'id', '?')}"
+
+
 def _author_dict(sender: Any) -> dict[str, Any]:
     if sender is None:
         return {"id": "unknown", "name": "Unknown"}
-    name_parts: list[str] = []
-    first = getattr(sender, "first_name", None)
-    last = getattr(sender, "last_name", None)
-    title = getattr(sender, "title", None)
-    if title:
-        name_parts.append(str(title))
-    else:
-        if first:
-            name_parts.append(first)
-        if last:
-            name_parts.append(last)
-    name = " ".join(p for p in name_parts if p) or (
-        f"@{sender.username}" if getattr(sender, "username", None) else f"id:{getattr(sender, 'id', '?')}"
+    return {"id": str(getattr(sender, "id", "unknown")), "name": _resolve_name(sender)}
+
+
+def _build_speaker_header(
+    author_name: str,
+    sender_username: str | None,
+    metadata: dict[str, Any],
+) -> str:
+    """Render the first-line speaker header that gets prepended to the
+    agent's view of the message text. The agent's LLM sees this verbatim,
+    so the format needs to be chat-like and easy to attribute.
+
+    Examples:
+        "BobSmith (@bobby): "
+        "↳ in reply to OldBobby: \\"earlier message...\\"\\nBobSmith (@bobby): "
+    """
+    name_part = f"{author_name} (@{sender_username})" if sender_username else author_name
+
+    reply_lines: list[str] = []
+    if metadata.get("isReply"):
+        reply_to_name = metadata.get("replyToAuthorName")
+        reply_to_content = metadata.get("replyToContent")
+        if reply_to_name and reply_to_content:
+            reply_lines.append(f'↳ in reply to {reply_to_name}: "{reply_to_content}"')
+        elif reply_to_name:
+            reply_lines.append(f"↳ in reply to {reply_to_name}")
+        elif reply_to_content:
+            reply_lines.append(f'↳ in reply to: "{reply_to_content}"')
+
+    if reply_lines:
+        return "\n".join(reply_lines + [f"{name_part}: "])
+    return f"{name_part}: "
+
+
+def _prepend_speaker_header(
+    content: list,
+    header: str,
+) -> list:
+    """Insert the speaker header into the first text block (or as a new
+    leading text block if there isn't one). Returns a new list — does not
+    mutate the input."""
+    out = list(content)
+    first_text_idx = next(
+        (i for i, b in enumerate(out) if b.get("type") == "text"), None
     )
-    return {"id": str(getattr(sender, "id", "unknown")), "name": name}
+    if first_text_idx is not None:
+        existing = out[first_text_idx].get("text", "")
+        out[first_text_idx] = {"type": "text", "text": f"{header}{existing}"}
+    else:
+        out.insert(0, {"type": "text", "text": header.rstrip(": \n") or header})
+    return out
 
 
 def _extract_mention_ids(message: Any) -> list[int]:
@@ -182,6 +240,23 @@ async def build_incoming_message(
             replied_text = (getattr(replied, "message", "") or "").strip()
             if replied_text:
                 metadata["replyToContent"] = replied_text[:REPLY_SNIPPET_MAX]
+            # Resolve the replied-to author's display name so the agent
+            # knows whom it's responding to. Telethon caches dialog
+            # entities at startup, so .sender is usually populated; fall
+            # back to an explicit fetch otherwise.
+            replied_sender = getattr(replied, "sender", None)
+            if replied_sender is None:
+                try:
+                    replied_sender = await replied.get_sender()
+                except Exception:  # noqa: BLE001
+                    replied_sender = None
+            if replied_sender is not None:
+                replied_name = _resolve_name(replied_sender)
+                if replied_name and replied_name != "Unknown":
+                    metadata["replyToAuthorName"] = replied_name
+                replied_username = getattr(replied_sender, "username", None)
+                if replied_username:
+                    metadata["replyToAuthorUsername"] = replied_username
 
     # Forum topic id (supergroups only)
     thread_id: str | None = None
@@ -195,14 +270,21 @@ async def build_incoming_message(
 
     timestamp = message.date.astimezone(timezone.utc).isoformat() if message.date else ""
 
+    # Build content, then prepend a speaker header so the LLM can see who's
+    # talking — without this the agent has only the raw message text and no
+    # way to attribute it to an author.
+    raw_content = message_to_content_blocks(
+        message, account_label=account_label, chat_id=chat_id
+    )
+    header = _build_speaker_header(author["name"], sender_username, metadata)
+    content = _prepend_speaker_header(raw_content, header)
+
     incoming: ChannelIncomingMessage = {
         "channelId": descriptor["id"],
         "messageId": str(message.id),
         "author": author,
         "timestamp": timestamp,
-        "content": message_to_content_blocks(
-            message, account_label=account_label, chat_id=chat_id
-        ),
+        "content": content,
         "metadata": metadata,
     }
     if thread_id is not None:
