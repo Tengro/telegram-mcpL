@@ -290,6 +290,13 @@ async def attach_event_handlers(
 
     @client.on(events.NewMessage)
     async def on_new_message(event):  # pragma: no cover — real-Telegram path
+        # Skip outgoing messages — Telethon fires NewMessage for messages we
+        # send too, and bouncing the agent's own posts back to the host as
+        # fresh incoming would create an echo loop (the gate would re-trigger,
+        # the agent would see its own reply, etc.). The agent's identity is
+        # its Telegram account; its own posts don't need to feed back in.
+        if getattr(event, "out", False):
+            return
         try:
             payload = await build_incoming_message(
                 event,
