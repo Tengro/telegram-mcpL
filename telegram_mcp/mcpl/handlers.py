@@ -202,26 +202,64 @@ def make_typing_handler(
     *,
     resolve_entity_fn,
     ensure_connected_fn,
-    default_duration: float = 3.0,
+    refresh_window: float = 10.0,
+    max_typing: float = 300.0,
 ):
-    """Fire a brief typing pulse on the named channel.
+    """Drive a continuous Telegram typing indicator from channels/typing.
 
-    channels/typing is a notification, so we kick off the actual typing in
-    a background task and return immediately — long pulses must not block
-    the dispatcher's reader loop.
+    The host refreshes typing roughly every 7s while inference is active
+    (TYPING_INTERVAL_MS in the host's channel-registry) — with ``op`` absent
+    — and sends one final notification with ``op="stop"`` when the turn ends.
+    So we keep a SINGLE background task per channel that holds Telethon's
+    typing action open (it auto-resends every ~4s) and:
+
+      * start / refresh (``op`` != ``"stop"``) — (re)arm a deadline
+        ``refresh_window`` seconds out and, if no task is running, start one;
+      * stop (``op`` == ``"stop"``) — cancel the task so typing clears at once.
+
+    If the host stops refreshing without a stop (e.g. a dropped notification),
+    the deadline lapses and typing clears on its own; ``max_typing`` is an
+    absolute safety cap so a stuck refresher can't pin "typing…" forever.
+    channels/typing is a notification, so the handler returns immediately and
+    does the actual typing in the background. Best-effort throughout — a
+    typing failure must never break the agent.
     """
 
-    async def _do_typing(client: TelegramClient, peer: Any, duration: float) -> None:
+    tasks: dict[str, asyncio.Task[None]] = {}
+    deadlines: dict[str, float] = {}
+
+    async def _keep_typing(channel_id: str, client: TelegramClient, peer: Any) -> None:
+        loop = asyncio.get_running_loop()
+        hard_stop = loop.time() + max_typing
         try:
             async with client.action(peer, "typing"):
-                await asyncio.sleep(min(duration, 30.0))  # cap at Telegram's 30s
+                while True:
+                    now = loop.time()
+                    if now >= deadlines.get(channel_id, 0.0) or now >= hard_stop:
+                        break
+                    await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            pass  # stop() cancelled us — let the action context clear typing
         except Exception:
             log.exception("channels/typing — action failed")
+        finally:
+            tasks.pop(channel_id, None)
+            deadlines.pop(channel_id, None)
 
     async def handle_typing(params: dict[str, Any]) -> None:
         channel_id = params.get("channelId")
         if not channel_id:
             return
+
+        # Stop — cancel any active typing for this channel.
+        if params.get("op") == "stop":
+            deadlines.pop(channel_id, None)
+            task = tasks.pop(channel_id, None)
+            if task is not None:
+                task.cancel()
+            return
+
+        # Start / refresh.
         try:
             account_label, kind, peer_id = parse_channel_id(channel_id)
         except ValueError:
@@ -230,10 +268,17 @@ def make_typing_handler(
         client = clients.get(account_label)
         if client is None:
             return
+
+        # Arm the deadline first so an already-running loop picks it up.
+        deadlines[channel_id] = asyncio.get_running_loop().time() + refresh_window
+        if channel_id in tasks:
+            return  # already typing — the bumped deadline keeps it alive
+
         await ensure_connected_fn(client)
         peer: Any = "me" if kind == "saved" else await resolve_entity_fn(peer_id, client)
-        duration = float(params.get("duration", default_duration))
-        # Fire and forget — the host doesn't expect a response.
-        asyncio.create_task(_do_typing(client, peer, duration))
+        if peer is None:
+            deadlines.pop(channel_id, None)  # entity didn't resolve — undo the arm
+            return
+        tasks[channel_id] = asyncio.create_task(_keep_typing(channel_id, client, peer))
 
     return handle_typing

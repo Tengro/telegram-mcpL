@@ -358,7 +358,7 @@ class FakeClientWithAction(FakeClient):
 
 
 @pytest.mark.asyncio
-async def test_typing_handler_returns_immediately_and_runs_in_background():
+async def test_typing_handler_starts_on_refresh_and_stops_on_op_stop():
     client = FakeClientWithAction()
     resolved = object()
 
@@ -372,18 +372,28 @@ async def test_typing_handler_returns_immediately_and_runs_in_background():
         {"default": client},
         resolve_entity_fn=resolve_entity_fn,
         ensure_connected_fn=ensure_connected_fn,
-        default_duration=0.01,
+        refresh_window=5.0,
     )
 
-    # Handler must NOT block for the duration of the typing action.
+    # Start/refresh (op absent) must NOT block and must begin typing.
     result = await asyncio.wait_for(
         handle({"channelId": "telegram:default:dm:42"}), timeout=0.5
     )
     assert result is None  # notification — no return value
 
-    # Let the background typing task run.
     await asyncio.sleep(0.05)
     assert ("typing-start", (resolved, "typing")) in client.actions
+    # Still typing — the deadline is 5s out and no stop has arrived yet.
+    assert ("typing-end", (resolved, "typing")) not in client.actions
+
+    # A second refresh must NOT spawn a duplicate task — just keep the one.
+    await handle({"channelId": "telegram:default:dm:42"})
+    await asyncio.sleep(0.02)
+    assert client.actions.count(("typing-start", (resolved, "typing"))) == 1
+
+    # op="stop" clears the indicator promptly.
+    await handle({"channelId": "telegram:default:dm:42", "op": "stop"})
+    await asyncio.sleep(0.05)
     assert ("typing-end", (resolved, "typing")) in client.actions
 
 
