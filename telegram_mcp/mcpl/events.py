@@ -273,7 +273,7 @@ async def build_incoming_message(
     # Build content, then prepend a speaker header so the LLM can see who's
     # talking — without this the agent has only the raw message text and no
     # way to attribute it to an author.
-    raw_content = message_to_content_blocks(
+    raw_content = await message_to_content_blocks(
         message, account_label=account_label, chat_id=chat_id
     )
     header = _build_speaker_header(author["name"], sender_username, metadata)
